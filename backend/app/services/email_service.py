@@ -1,5 +1,6 @@
 import smtplib
 import logging
+import httpx
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 import markdown
@@ -10,7 +11,6 @@ logger = logging.getLogger(__name__)
 
 
 def render_email_html(summary_markdown: str, filename: str) -> str:
-    """Convert markdown summary to styled HTML email."""
     body_html = markdown.markdown(summary_markdown)
     return f"""<!DOCTYPE html>
 <html>
@@ -55,23 +55,43 @@ def render_email_html(summary_markdown: str, filename: str) -> str:
 </html>"""
 
 
+async def send_email_resend(to_email: str, subject: str, html_content: str) -> None:
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.resend.com/emails",
+                headers={
+                    "Authorization": f"Bearer {settings.RESEND_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "from": f"{settings.FROM_NAME} <onboarding@resend.dev>",
+                    "to": [to_email],
+                    "subject": subject,
+                    "html": html_content,
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            logger.info(f"Email sent via Resend to {to_email}")
+    except Exception as e:
+        logger.error(f"Resend error: {e}")
+        raise HTTPException(status_code=502, detail=f"Email delivery failed: {str(e)}")
+
+
 async def send_email_smtp(to_email: str, subject: str, html_content: str, text_content: str) -> None:
-    """Send email via SMTP."""
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = f"{settings.FROM_NAME} <{settings.FROM_EMAIL}>"
         msg["To"] = to_email
-
         msg.attach(MIMEText(text_content, "plain"))
         msg.attach(MIMEText(html_content, "html"))
-
         with smtplib.SMTP(settings.SMTP_HOST, settings.SMTP_PORT) as server:
             server.ehlo()
             server.starttls()
             server.login(settings.SMTP_USER, settings.SMTP_PASSWORD)
             server.sendmail(settings.FROM_EMAIL, to_email, msg.as_string())
-
         logger.info(f"Email sent via SMTP to {to_email}")
     except Exception as e:
         logger.error(f"SMTP send error: {e}")
@@ -79,11 +99,9 @@ async def send_email_smtp(to_email: str, subject: str, html_content: str, text_c
 
 
 async def send_email_sendgrid(to_email: str, subject: str, html_content: str, text_content: str) -> None:
-    """Send email via SendGrid."""
     try:
         from sendgrid import SendGridAPIClient
         from sendgrid.helpers.mail import Mail, Content, To
-
         sg = SendGridAPIClient(api_key=settings.SENDGRID_API_KEY)
         message = Mail(
             from_email=(settings.FROM_EMAIL, settings.FROM_NAME),
@@ -92,7 +110,6 @@ async def send_email_sendgrid(to_email: str, subject: str, html_content: str, te
         )
         message.add_content(Content("text/plain", text_content))
         message.add_content(Content("text/html", html_content))
-
         response = sg.send(message)
         logger.info(f"Email sent via SendGrid to {to_email}, status: {response.status_code}")
     except Exception as e:
@@ -101,13 +118,16 @@ async def send_email_sendgrid(to_email: str, subject: str, html_content: str, te
 
 
 async def send_insight_email(to_email: str, summary: str, filename: str) -> None:
-    """Dispatch the AI summary email to recipient."""
     subject = f"📊 Sales Insight Report — {filename}"
     html_content = render_email_html(summary, filename)
     text_content = f"Sales Insight Report\n\nSource: {filename}\n\n{summary}"
 
     provider = settings.EMAIL_PROVIDER.lower()
-    if provider == "sendgrid":
+    if provider == "resend":
+        if not settings.RESEND_API_KEY:
+            raise HTTPException(status_code=500, detail="RESEND_API_KEY not configured.")
+        await send_email_resend(to_email, subject, html_content)
+    elif provider == "sendgrid":
         if not settings.SENDGRID_API_KEY:
             raise HTTPException(status_code=500, detail="SENDGRID_API_KEY not configured.")
         await send_email_sendgrid(to_email, subject, html_content, text_content)
